@@ -78,3 +78,25 @@ The current patch also contains diagnostic logging and Windows DLL instrumentati
 5. Review temporary diagnostic code and decide what should remain in the published patch.
 
 No compiled binaries, build outputs, or local scene assets are distributed by this repository.
+
+## Reference assets
+
+The repository includes reference files from the SO-101 laboratory simulation project.
+
+### USD scenes and robot model
+
+- `assets/usd/LabSceneDefV2.usdc` — laboratory scene without the SO-101 arm.
+- `assets/usd/LabSceneDefV2_WithSO-101.usd` — laboratory scene with the white SO-101 arm.
+- `assets/usd/WorkingSO-101_White.usd` — white-recolored SO-101 model referenced by the combined scene.
+
+### Blender source
+
+- `assets/blender/LabScene.blend` — Blender source scene used as a reference for the laboratory environment.
+
+### Dependencies and limitations
+
+The USD files were inspected in the author's development environment. Their portability and rendering on a clean installation have not been verified.
+
+The SO-101-related USD files reference `OmniPBR.mdl`, an external material definition commonly provided by NVIDIA Omniverse/Isaac Sim. This dependency is not included in the repository. Materials may therefore appear differently, or fail to resolve, in other environments.
+
+These files are provided as reference assets. They do not constitute a complete, independently verified simulation package, and the original Blender scene may require additional software or assets to reproduce the author's workflow.
