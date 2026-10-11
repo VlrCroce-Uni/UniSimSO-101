@@ -1,0 +1,1407 @@
+diff --git a/cmake/third_party_deps/openusd/CMakeLists.txt b/cmake/third_party_deps/openusd/CMakeLists.txt
+index 4eb02281..637991e1 100644
+--- a/cmake/third_party_deps/openusd/CMakeLists.txt
++++ b/cmake/third_party_deps/openusd/CMakeLists.txt
+@@ -47,5 +47,6 @@ ExternalProject_Add(openusd
+       --no-imaging
+       --no-python
+       --no-usdValidation
++      --generator "Visual Studio 18 2026"
+       <INSTALL_DIR>
+ )
+diff --git a/plugin/usd_decoder/CMakeLists.txt b/plugin/usd_decoder/CMakeLists.txt
+index 3181e350..081f9064 100644
+--- a/plugin/usd_decoder/CMakeLists.txt
++++ b/plugin/usd_decoder/CMakeLists.txt
+@@ -19,6 +19,7 @@ set(USD_DECODER_SRCS
+     kinematic_tree.h
+     material_parsing.cc
+     material_parsing.h
++    newton_tokens.cc
+ )
+ 
+ add_library(usd_decoder_plugin SHARED ${USD_DECODER_SRCS})
+@@ -34,8 +35,18 @@ target_compile_options(usd_decoder_plugin PRIVATE
+   ${MUJOCO_MACOS_COMPILE_OPTIONS}
+   ${EXTRA_COMPILE_OPTIONS}
+   ${MUJOCO_CXX_FLAGS}
+-  -Wno-deprecated # pxr Tf lib uses deprecated header
+ )
++
++if(NOT MSVC)
++  target_compile_options(usd_decoder_plugin PRIVATE
++    -Wno-deprecated # pxr Tf lib uses deprecated header
++  )
++endif()
++
++if(MSVC)
++  target_compile_definitions(usd_decoder_plugin PRIVATE NOMINMAX)
++endif()
++
+ target_link_options(usd_decoder_plugin PRIVATE
+   ${MUJOCO_MACOS_LINK_OPTIONS}
+   ${EXTRA_LINK_OPTIONS}
+@@ -48,4 +59,4 @@ install(
+   LIBRARY DESTINATION "${CMAKE_INSTALL_BINDIR}/mujoco_plugin"
+ )
+ 
+-target_link_libraries(usd_decoder_plugin PRIVATE usd usdGeom usdPhysics usdShade gf tf ar vt kind)
++target_link_libraries(usd_decoder_plugin PRIVATE usd usdGeom usdLux usdPhysics usdShade gf tf ar vt kind)
+diff --git a/plugin/usd_decoder/kinematic_tree.cc b/plugin/usd_decoder/kinematic_tree.cc
+index ef1d6ab4..dcbbf9b3 100644
+--- a/plugin/usd_decoder/kinematic_tree.cc
++++ b/plugin/usd_decoder/kinematic_tree.cc
+@@ -13,7 +13,7 @@
+ // limitations under the License.
+ 
+ #include "kinematic_tree.h"
+-#include "third_party/mujoco/plugin/usd_decoder/newton_tokens.h"
++#include "newton_tokens.h"
+ 
+ #include <map>
+ #include <memory>
+diff --git a/plugin/usd_decoder/material_parsing.cc b/plugin/usd_decoder/material_parsing.cc
+index 9c8a5089..d0b029df 100644
+--- a/plugin/usd_decoder/material_parsing.cc
++++ b/plugin/usd_decoder/material_parsing.cc
+@@ -24,6 +24,7 @@
+ #include <pxr/base/tf/staticData.h>
+ #include <pxr/base/tf/staticTokens.h>
+ #include <pxr/base/tf/token.h>
++#include <pxr/usd/sdf/assetPath.h>
+ #include <pxr/usd/usd/prim.h>
+ #include <pxr/usd/usdShade/input.h>
+ #include <pxr/usd/usdShade/material.h>
+@@ -51,6 +52,15 @@ TF_DEFINE_PRIVATE_TOKENS(kTokens,
+                          ((srgb, "sRGB"))
+                          ((UsdPreviewSurface, "UsdPreviewSurface"))
+                          ((UsdUVTexture, "UsdUVTexture"))
++                         ((diffuse_color_constant, "diffuse_color_constant"))
++                         ((mdl, "mdl"))
++                         ((OmniPBR, "OmniPBR"))
++                         ((base_color, "base_color"))
++                         ((geometry_opacity, "geometry_opacity"))
++                         ((mtlx, "mtlx"))
++                         ((ND_open_pbr_surface_surfaceshader,
++                           "ND_open_pbr_surface_surfaceshader"))
++                         ((specular_roughness, "specular_roughness"))
+                          );
+ // clang-format on
+ 
+@@ -262,24 +272,96 @@ void ParsePreviewSurface(mjSpec* spec, mjsMaterial* material,
+                     roughness);
+ }
+ 
++
++void ParseMaterialXSurface(mjSpec* spec, mjsMaterial* material,
++                           const pxr::UsdShadeShader& shader) {
++  // Blender's MaterialX Principled shader uses base_color for RGB.
++  auto diffuse = ReadShaderInput<pxr::GfVec3f>(
++      spec, shader.GetInput(kTokens->base_color));
++  AssignShaderInput(spec, material, &material->rgba, mjTEXROLE_RGB, diffuse);
++
++  // Unlike the RGB color, opacity is a separate scalar input.
++  auto opacity = ReadShaderInput<float>(
++      spec, shader.GetInput(kTokens->geometry_opacity));
++  if (opacity.value.has_value()) {
++    material->rgba[3] = opacity.value.value();
++  }
++
++  auto roughness = ReadShaderInput<float>(
++      spec, shader.GetInput(kTokens->specular_roughness));
++  AssignShaderInput(spec, material, &material->roughness,
++                    mjTEXROLE_ROUGHNESS, roughness);
++}
++
++
+ mjsMaterial* ParseMaterial(mjSpec* spec,
+                            const pxr::UsdShadeMaterial& material) {
+-  pxr::UsdShadeShader surface_shader = material.ComputeSurfaceSource();
++
++  // Prefer Blender's MaterialX Principled shader when it is available
++  // and supported by this decoder.
++  pxr::UsdShadeShader surface_shader =
++      material.ComputeSurfaceSource(kTokens->mtlx);
++
++  bool is_materialx =
++      surface_shader.GetPrim().IsValid() &&
++      GetShaderId(surface_shader) ==
++          kTokens->ND_open_pbr_surface_surfaceshader;
++
++  // Otherwise, preserve the existing Isaac Sim MDL and universal fallbacks.
++  if (!is_materialx) {
++    surface_shader = material.ComputeSurfaceSource(kTokens->mdl);
++
++    if (!surface_shader.GetPrim().IsValid()) {
++      surface_shader = material.ComputeSurfaceSource();
++    }
++  }
++
+   if (!surface_shader.GetPrim().IsValid()) {
+-    mju_warning("Material %s has no surface output.",
++    mju_warning("Material %s has no supported surface output.",
+                 material.GetPath().GetAsString().c_str());
+     return nullptr;
+   }
+ 
+-  pxr::TfToken surface_shader_id = GetShaderId(surface_shader);
+-  if (surface_shader_id != kTokens->UsdPreviewSurface) {
+-    mju_warning("Mujoco only supports UsdPreviewSurface as surface output.");
++  const pxr::TfToken surface_shader_id = GetShaderId(surface_shader);
++  const bool is_preview_surface =
++      surface_shader_id == kTokens->UsdPreviewSurface;
++
++  pxr::SdfAssetPath source_asset;
++  pxr::TfToken source_sub_identifier;
++  const bool has_mdl_asset =
++      surface_shader.GetSourceAsset(&source_asset, kTokens->mdl);
++  const bool has_mdl_sub_identifier =
++      surface_shader.GetSourceAssetSubIdentifier(
++          &source_sub_identifier, kTokens->mdl);
++
++  const bool is_omnipbr =
++      (has_mdl_asset &&
++       source_asset.GetAssetPath().find("OmniPBR.mdl") != std::string::npos) ||
++      (has_mdl_sub_identifier &&
++       source_sub_identifier == kTokens->OmniPBR);
++
++
++  if (!is_materialx && !is_preview_surface && !is_omnipbr) {
++    mju_warning("Unsupported surface shader on material %s.",
++                material.GetPath().GetAsString().c_str());
+     return nullptr;
+   }
+ 
++
+   mjsMaterial* mj_mat = mjs_addMaterial(spec, nullptr);
+   mjs_setName(mj_mat->element, material.GetPath().GetAsString().c_str());
+-  ParsePreviewSurface(spec, mj_mat, surface_shader);
++
++  if (is_materialx) {
++    ParseMaterialXSurface(spec, mj_mat, surface_shader);
++  } else if (is_preview_surface) {
++    ParsePreviewSurface(spec, mj_mat, surface_shader);
++  } else {
++    // OmniPBR uses this input for its authored base color.
++    auto diffuse = ReadShaderInput<pxr::GfVec3f>(
++        spec, surface_shader.GetInput(kTokens->diffuse_color_constant));
++    AssignShaderInput(spec, mj_mat, &mj_mat->rgba, mjTEXROLE_RGB, diffuse);
++  }
++
+ 
+   return mj_mat;
+ }
+diff --git a/plugin/usd_decoder/newton_tokens.cc b/plugin/usd_decoder/newton_tokens.cc
+index 04c6bfad..0cbf4f27 100644
+--- a/plugin/usd_decoder/newton_tokens.cc
++++ b/plugin/usd_decoder/newton_tokens.cc
+@@ -12,7 +12,7 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-#include "third_party/mujoco/plugin/usd_decoder/newton_tokens.h"
++#include "newton_tokens.h"
+ #include <pxr/base/tf/staticTokens.h>
+ #include <pxr/pxr.h>
+ 
+diff --git a/plugin/usd_decoder/usd_decoder.cc b/plugin/usd_decoder/usd_decoder.cc
+index 2a0606c0..4dfdbef5 100644
+--- a/plugin/usd_decoder/usd_decoder.cc
++++ b/plugin/usd_decoder/usd_decoder.cc
+@@ -41,8 +41,9 @@
+ #include <mujoco/mujoco.h>
+ #include "kinematic_tree.h"
+ #include "material_parsing.h"
+-#include "third_party/mujoco/plugin/usd_decoder/newton_tokens.h"
++#include "newton_tokens.h"
+ #include <pxr/base/gf/declare.h>
++#include <pxr/base/gf/matrix3d.h>
+ #include <pxr/base/gf/matrix4d.h>
+ #include <pxr/base/gf/matrix4f.h>
+ #include <pxr/base/gf/rotation.h>
+@@ -51,10 +52,13 @@
+ #include <pxr/base/tf/token.h>
+ #include <pxr/base/vt/types.h>
+ #include <pxr/usd/sdf/path.h>
++#include <pxr/usd/sdf/assetPath.h>
+ #include <pxr/usd/usd/common.h>
+ #include <pxr/usd/usd/prim.h>
+ #include <pxr/usd/usd/primFlags.h>
+ #include <pxr/usd/usd/stage.h>
++#include <pxr/usd/usd/primRange.h>
++#include <pxr/usd/usdGeom/camera.h>
+ #include <pxr/usd/usdGeom/capsule.h>
+ #include <pxr/usd/usdGeom/cube.h>
+ #include <pxr/usd/usdGeom/cylinder.h>
+@@ -67,6 +71,13 @@
+ #include <pxr/usd/usdGeom/sphere.h>
+ #include <pxr/usd/usdGeom/tokens.h>
+ #include <pxr/usd/usdGeom/xformCache.h>
++#include <pxr/usd/usdLux/rectLight.h>
++#include <pxr/usd/usdLux/sphereLight.h>
++#include <pxr/usd/usdLux/diskLight.h>
++#include <pxr/usd/usdLux/cylinderLight.h>
++#include <pxr/usd/usdLux/distantLight.h>
++#include <pxr/usd/usdLux/domeLight.h>
++#include <pxr/usd/usdLux/shapingAPI.h>
+ #include <pxr/usd/usdPhysics/collisionAPI.h>
+ #include <pxr/usd/usdPhysics/filteredPairsAPI.h>
+ #include <pxr/usd/usdPhysics/fixedJoint.h>
+@@ -83,6 +94,16 @@
+ #include <pxr/usd/usdShade/material.h>
+ #include <pxr/usd/usdShade/materialBindingAPI.h>
+ 
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++#ifdef _WIN32
++static void TestDllLoad() {
++  OutputDebugStringA("USD DLL LOAD TEST\n");
++}
++#endif
++
+ using mujoco::NewtonTokens;
+ using pxr::MjcPhysicsTokens;
+ using pxr::TfToken;
+@@ -2037,6 +2058,16 @@ void ParseUsdPhysicsCollider(mjSpec* spec,
+   geom->contype = 1;
+   geom->conaffinity = 1;
+ 
++  // Hide collision proxies under a dedicated "collisions" branch.
++  // Other colliders may also be the only visual geometry for an object.
++  const std::string prim_path = prim.GetPath().GetString();
++
++  const bool is_collision_proxy =
++      prim_path.find("/collisions/") != std::string::npos ||
++      prim_path.find("_Collisions/") != std::string::npos;
++
++  geom->group = is_collision_proxy ? 3 : 0;
++
+   SetUsdPrimPathUserValue(geom->element, prim.GetPath());
+ 
+   ParseNewtonMassAPIForGeom(geom, prim);
+@@ -2682,6 +2713,435 @@ bool IsObjectInPhysicsScene(const T& object,
+ // Helper type to store all the prims that belong to a body.
+ using BodyPrimMap = std::map<pxr::SdfPath, std::vector<pxr::SdfPath>>;
+ 
++void ParseUsdCamera(pxr::UsdStageRefPtr stage, mjSpec* spec,
++                    const pxr::UsdPrim& prim,
++                    pxr::UsdGeomXformCache& xform_cache) {
++  pxr::UsdGeomCamera usd_camera(prim);
++
++  printf("USD DECODER: CAMERA FOUND: %s\n",
++       prim.GetPath().GetAsString().c_str());
++
++  mjsCamera* camera = mjs_addCamera(mjs_findBody(spec, "world"), nullptr);
++
++  mjs_setName(camera->element, prim.GetPath().GetAsString().c_str());
++  SetUsdPrimPathUserValue(camera->element, prim.GetPath());
++
++  // The USD camera is attached to the world, so use the stage pseudo-root
++  // as its parent when converting its transform.
++  SetLocalPoseFromPrim(
++      prim, stage->GetPseudoRoot(), camera, xform_cache);
++
++  // USD camera projection.
++  pxr::TfToken projection;
++  if (usd_camera.GetProjectionAttr().Get(&projection) &&
++      projection == pxr::TfToken("orthographic")) {
++    camera->proj = mjPROJ_ORTHOGRAPHIC;
++  } else {
++    camera->proj = mjPROJ_PERSPECTIVE;
++  }
++
++  // Convert USD vertical aperture and focal length to MuJoCo vertical FOV.
++  double focal_length = 0.0;
++  double vertical_aperture = 0.0;
++
++  if (usd_camera.GetFocalLengthAttr().Get(&focal_length) &&
++      usd_camera.GetVerticalApertureAttr().Get(&vertical_aperture) &&
++      focal_length > 0.0) {
++    camera->fovy =
++        2.0 * std::atan(vertical_aperture / (2.0 * focal_length)) *
++        180.0 / std::numbers::pi;
++  }
++}
++
++void ParseUsdRectLight(
++    mjSpec* spec,
++    const pxr::UsdPrim& prim,
++    pxr::UsdGeomXformCache& xform_cache) {
++  pxr::UsdLuxRectLight usd_light(prim);
++
++  printf("USD DECODER: RECT LIGHT FOUND: %s\n",
++         prim.GetPath().GetAsString().c_str());
++
++  mjsLight* light = mjs_addLight(mjs_findBody(spec, "world"), nullptr);
++
++  mjs_setName(light->element, prim.GetPath().GetAsString().c_str());
++  SetUsdPrimPathUserValue(light->element, prim.GetPath());
++
++  // The USD RectLight is attached to the world, so use its world
++  // transform directly. MuJoCo lights use position + direction
++  // rather than a position + quaternion pose.
++  pxr::GfMatrix4d xform =
++      xform_cache.GetLocalToWorldTransform(prim);
++
++  pxr::GfVec3d position = xform.ExtractTranslation();
++
++  light->pos[0] = position[0];
++  light->pos[1] = position[1];
++  light->pos[2] = position[2];
++
++  pxr::GfMatrix3d rotation = xform.ExtractRotationMatrix();
++
++  pxr::GfVec3d direction(
++      -rotation[2][0],
++      -rotation[2][1],
++      -rotation[2][2]);
++
++  direction.Normalize();
++
++  light->dir[0] = direction[0];
++  light->dir[1] = direction[1];
++  light->dir[2] = direction[2];
++
++  // MuJoCo spot light.
++  light->type = mjLIGHT_DIRECTIONAL;
++  light->active = 1;
++  light->castshadow = 1;
++
++  // USD light color.
++  pxr::GfVec3f color(1.0f, 1.0f, 1.0f);
++  usd_light.GetColorAttr().Get(&color);
++
++  light->diffuse[0] = color[0];
++  light->diffuse[1] = color[1];
++  light->diffuse[2] = color[2];
++
++  light->specular[0] = color[0];
++  light->specular[1] = color[1];
++  light->specular[2] = color[2];
++
++  // USD intensity is not directly expressed in MuJoCo light units.
++  // Start with the authored value as a visual approximation.
++  float intensity = 0.0f;
++  pxr::UsdAttribute intensity_attr =
++      prim.GetAttribute(pxr::TfToken("inputs:intensity"));
++
++  if (intensity_attr.Get(&intensity)) {
++    light->intensity = intensity;
++  }
++
++  printf("USD DECODER: LIGHT INTENSITY = %.6f\n",
++         static_cast<double>(intensity));
++  // Use the larger RectLight dimension to determine a reasonable
++  // starting spotlight cone.
++  double width = 0.0;
++  double height = 0.0;
++
++  usd_light.GetWidthAttr().Get(&width);
++  usd_light.GetHeightAttr().Get(&height);
++
++  double size = std::max(width, height);
++
++  if (size > 0.0) {
++    // Approximate the angular extent of the rectangular emitter.
++    // The exact distance-dependent USD area-light behavior cannot be
++    // represented by a single MuJoCo spot light.
++    light->cutoff = 45.0;
++  }
++
++  light->exponent = 1.0;
++
++  printf(
++    "USD DECODER: FINAL RECT LIGHT "
++    "type=%d active=%d shadow=%d "
++    "pos=(%.3f, %.3f, %.3f) "
++    "dir=(%.3f, %.3f, %.3f) "
++    "intensity=%.3f "
++    "cutoff=%.3f softness=%.3f exponent=%.3f\n",
++    light->type,
++    light->active,
++    light->castshadow,
++    light->pos[0],
++    light->pos[1],
++    light->pos[2],
++    light->dir[0],
++    light->dir[1],
++    light->dir[2],
++    light->intensity,
++    light->cutoff,
++    light->softness,
++    light->exponent);
++
++}
++
++double GetUsdLightIntensity(const pxr::UsdPrim& prim) {
++  float value = 0.0f;
++
++  pxr::UsdAttribute attr =
++      prim.GetAttribute(pxr::TfToken("inputs:intensity"));
++
++  if (attr.Get(&value)) {
++    return static_cast<double>(value);
++  }
++
++  return 0.0;
++}
++
++double GetUsdLightExposure(const pxr::UsdPrim& prim) {
++  float value = 0.0f;
++
++  pxr::UsdAttribute attr =
++      prim.GetAttribute(pxr::TfToken("inputs:exposure"));
++
++  if (attr.Get(&value)) {
++    return static_cast<double>(value);
++  }
++
++  return 0.0;
++}
++
++pxr::GfVec3f GetUsdLightColor(const pxr::UsdPrim& prim) {
++  pxr::GfVec3f color(1.0f, 1.0f, 1.0f);
++
++  pxr::UsdAttribute attr =
++      prim.GetAttribute(pxr::TfToken("inputs:color"));
++
++  attr.Get(&color);
++
++  return color;
++}
++
++void InitializeUsdLight(mjsLight* light, const pxr::UsdPrim& prim) {
++  mjs_setName(light->element, prim.GetPath().GetAsString().c_str());
++  SetUsdPrimPathUserValue(light->element, prim.GetPath());
++
++  light->active = 1;
++  light->castshadow = 1;
++
++  pxr::GfVec3f color = GetUsdLightColor(prim);
++
++  light->diffuse[0] = color[0];
++  light->diffuse[1] = color[1];
++  light->diffuse[2] = color[2];
++
++  light->specular[0] = color[0];
++  light->specular[1] = color[1];
++  light->specular[2] = color[2];
++
++  double intensity = GetUsdLightIntensity(prim);
++  double exposure = GetUsdLightExposure(prim);
++
++  light->intensity = intensity * std::pow(2.0, exposure);
++
++}
++
++void SetUsdLightPose(const pxr::UsdPrim& prim,
++                     pxr::UsdGeomXformCache& xform_cache,
++                     mjsLight* light) {
++  pxr::GfMatrix4d xform =
++      xform_cache.GetLocalToWorldTransform(prim);
++
++  pxr::GfVec3d position = xform.ExtractTranslation();
++
++  light->pos[0] = position[0];
++  light->pos[1] = position[1];
++  light->pos[2] = position[2];
++
++  pxr::GfMatrix3d rotation = xform.ExtractRotationMatrix();
++
++  // USD lights emit along their local -Z axis.
++  pxr::GfVec3d direction(
++      -rotation[2][0],
++      -rotation[2][1],
++      -rotation[2][2]);
++
++  direction.Normalize();
++
++  light->dir[0] = direction[0];
++  light->dir[1] = direction[1];
++  light->dir[2] = direction[2];
++
++}
++
++void ParseUsdSphereLight(
++    mjSpec* spec,
++    const pxr::UsdPrim& prim,
++    pxr::UsdGeomXformCache& xform_cache) {
++  printf("USD DECODER: SPHERE LIGHT FOUND: %s\n",
++         prim.GetPath().GetAsString().c_str());
++
++  printf(
++    "USD DECODER: LIGHT ENUMS "
++    "POINT=%d SPOT=%d DIRECTIONAL=%d\n",
++    mjLIGHT_POINT,
++    mjLIGHT_SPOT,
++    mjLIGHT_DIRECTIONAL);
++
++  mjsLight* light =
++      mjs_addLight(mjs_findBody(spec, "world"), nullptr);
++
++  InitializeUsdLight(light, prim);
++  SetUsdLightPose(prim, xform_cache, light);
++
++  pxr::UsdLuxShapingAPI shaping(prim);
++
++  float cone_angle = 0.0f;
++
++  if (shaping.GetShapingConeAngleAttr().Get(&cone_angle)) {
++    printf("USD DECODER: SPHERE LIGHT HAS SHAPING CONE: %.3f degrees\n",
++           cone_angle);
++
++  light->type = mjLIGHT_SPOT;
++  light->cutoff = cone_angle;
++
++  float cone_softness = 0.0f;
++  if (shaping.GetShapingConeSoftnessAttr().Get(&cone_softness)) {
++    light->softness = cone_softness;
++  }
++  } else {
++    light->type = mjLIGHT_POINT;
++  }
++
++  printf("USD DECODER: SPHERE LIGHT MUJOCO INTENSITY = %.6f\n",
++         light->intensity);
++
++  printf(
++    "USD DECODER: FINAL SPHERE LIGHT "
++    "type=%d active=%d shadow=%d "
++    "pos=(%.3f, %.3f, %.3f) "
++    "dir=(%.3f, %.3f, %.3f) "
++    "intensity=%.3f "
++    "cutoff=%.3f softness=%.3f exponent=%.3f\n",
++    light->type,
++    light->active,
++    light->castshadow,
++    light->pos[0],
++    light->pos[1],
++    light->pos[2],
++    light->dir[0],
++    light->dir[1],
++    light->dir[2],
++    light->intensity,
++    light->cutoff,
++    light->softness,
++    light->exponent);
++
++}
++
++
++
++void ParseUsdDiskLight(
++    mjSpec* spec,
++    const pxr::UsdPrim& prim,
++    pxr::UsdGeomXformCache& xform_cache) {
++  printf("USD DECODER: DISK LIGHT FOUND: %s\n",
++         prim.GetPath().GetAsString().c_str());
++
++  mjsLight* light =
++      mjs_addLight(mjs_findBody(spec, "world"), nullptr);
++
++  InitializeUsdLight(light, prim);
++  SetUsdLightPose(prim, xform_cache, light);
++
++  light->type = mjLIGHT_SPOT;
++  light->cutoff = 45.0;
++  light->exponent = 1.0;
++}
++
++void ParseUsdCylinderLight(
++    mjSpec* spec,
++    const pxr::UsdPrim& prim,
++    pxr::UsdGeomXformCache& xform_cache) {
++  printf("USD DECODER: CYLINDER LIGHT FOUND: %s\n",
++         prim.GetPath().GetAsString().c_str());
++
++  mjsLight* light =
++      mjs_addLight(mjs_findBody(spec, "world"), nullptr);
++
++  InitializeUsdLight(light, prim);
++  SetUsdLightPose(prim, xform_cache, light);
++
++  light->type = mjLIGHT_SPOT;
++  light->cutoff = 45.0;
++  light->exponent = 1.0;
++}
++
++void ParseUsdDistantLight(
++    mjSpec* spec,
++    const pxr::UsdPrim& prim,
++    pxr::UsdGeomXformCache& xform_cache) {
++  printf("USD DECODER: DISTANT LIGHT FOUND: %s\n",
++         prim.GetPath().GetAsString().c_str());
++
++  mjsLight* light =
++      mjs_addLight(mjs_findBody(spec, "world"), nullptr);
++
++  InitializeUsdLight(light, prim);
++  SetUsdLightPose(prim, xform_cache, light);
++
++  light->type = mjLIGHT_DIRECTIONAL;
++  light->intensity = GetUsdLightIntensity(prim);
++}
++
++void ParseUsdDomeLight(
++    mjSpec* spec,
++    pxr::UsdStageRefPtr stage,
++    const pxr::UsdPrim& prim,
++    pxr::UsdGeomXformCache& xform_cache) {
++  printf("USD DECODER: DOME LIGHT FOUND: %s\n",
++         prim.GetPath().GetAsString().c_str());
++
++  pxr::UsdAttribute texture_attr =
++      prim.GetAttribute(pxr::TfToken("inputs:texture:file"));
++
++  pxr::SdfAssetPath asset_path;
++  if (!texture_attr.Get(&asset_path) || asset_path.GetAssetPath().empty()) {
++    printf("USD DECODER: DOME LIGHT has no texture; skipping.\n");
++    return;
++  }
++
++  std::string texture_path =
++    stage->GetRootLayer()->ComputeAbsolutePath(
++        asset_path.GetAssetPath());
++
++  printf("USD DECODER: DOME TEXTURE = %s\n",
++         texture_path.c_str());
++
++  mjsTexture* texture = mjs_addTexture(spec);
++
++  const std::string texture_name = "usd_dome_environment";
++
++  mjs_setName(texture->element, texture_name.c_str());
++  mjs_setString(texture->file, texture_path.c_str());
++  mjs_setString(texture->content_type, "image/ktx");
++
++  // The Filament image-light path expects an image texture.
++  texture->type = mjTEXTURE_2D;
++
++  mjsLight* light =
++      mjs_addLight(mjs_findBody(spec, "world"), nullptr);
++
++  InitializeUsdLight(light, prim);
++  SetUsdLightPose(prim, xform_cache, light);
++
++  light->type = mjLIGHT_IMAGE;
++  mjs_setString(light->texture, texture_name.c_str());
++
++  printf("USD DECODER: DOME LIGHT MUJOCO INTENSITY = %.6f\n",
++         light->intensity);
++}
++
++void ParseUsdLight(
++    mjSpec* spec,
++    pxr::UsdStageRefPtr stage,
++    const pxr::UsdPrim& prim,
++    pxr::UsdGeomXformCache& xform_cache) {
++  pxr::TfToken type = prim.GetTypeName();
++
++  if (type == pxr::TfToken("RectLight")) {
++    ParseUsdRectLight(spec, prim, xform_cache);
++  } else if (type == pxr::TfToken("SphereLight")) {
++    ParseUsdSphereLight(spec, prim, xform_cache);
++  } else if (type == pxr::TfToken("DiskLight")) {
++    ParseUsdDiskLight(spec, prim, xform_cache);
++  } else if (type == pxr::TfToken("CylinderLight")) {
++    ParseUsdCylinderLight(spec, prim, xform_cache);
++  } else if (type == pxr::TfToken("DistantLight")) {
++    ParseUsdDistantLight(spec, prim, xform_cache);
++  } else if (type == pxr::TfToken("DomeLight")) {
++    ParseUsdDomeLight(spec, stage, prim, xform_cache);
++  }
++}
++
+ // Recursively traverses the kinematic tree, creating bodies, joints, and geoms
+ // in the mjSpec.
+ void PopulateSpecFromTree(pxr::UsdStageRefPtr stage, mjSpec* spec,
+@@ -2791,17 +3251,139 @@ mjSpec* ParseStage(const pxr::UsdStageRefPtr stage) {
+   PopulateSpecFromTree(stage, spec, /*parent_mj_body=*/nullptr,
+                        /*parent_node=*/nullptr, root.get(), caches);
+ 
++  // Parse USD cameras.
++  printf("USD DECODER: BEGIN CAMERA SEARCH\n");
++
++  for (const pxr::UsdPrim& prim : stage->Traverse()) {
++    if (prim.GetTypeName() == pxr::TfToken("Camera")) {
++      printf("USD DECODER: CAMERA PRIM FOUND: %s\n",
++             prim.GetPath().GetAsString().c_str());
++
++      ParseUsdCamera(stage, spec, prim, caches.xform_cache);
++    }
++  }
++
++  // Parse USD lights.
++  printf("USD DECODER: BEGIN LIGHT SEARCH\n");
++
++  for (const pxr::UsdPrim& prim : stage->Traverse()) {
++    pxr::TfToken type = prim.GetTypeName();
++
++    if (type == pxr::TfToken("RectLight") ||
++        type == pxr::TfToken("SphereLight") ||
++        type == pxr::TfToken("DiskLight") ||
++        type == pxr::TfToken("CylinderLight") ||
++        type == pxr::TfToken("DistantLight") ||
++        type == pxr::TfToken("DomeLight")) {
++      ParseUsdLight(spec, stage, prim, caches.xform_cache);
++    }
++  }
++
++  printf("USD DECODER: ===== LIGHTS IN MJSPEC =====\n");
++
++  int light_index = 0;
++  for (mjsElement* element = mjs_firstElement(spec, mjOBJ_LIGHT);
++       element != nullptr;
++       element = mjs_nextElement(spec, element)) {
++    mjsLight* light = mjs_asLight(element);
++    if (light == nullptr) {
++      continue;
++    }
++
++    printf(
++        "LIGHT %d: name=%s type=%d active=%d intensity=%.6g "
++        "pos=(%.4f, %.4f, %.4f) dir=(%.4f, %.4f, %.4f) "
++        "cutoff=%.4f softness=%.4f\n",
++        light_index++,
++        mjs_getString(mjs_getName(element))
++            ? mjs_getString(mjs_getName(element))
++            : "(unnamed)",
++        static_cast<int>(light->type),
++        static_cast<int>(light->active),
++        light->intensity,
++        light->pos[0], light->pos[1], light->pos[2],
++        light->dir[0], light->dir[1], light->dir[2],
++        light->cutoff, light->softness);
++  }
++
++  printf("USD DECODER: ===== END LIGHTS =====\n");
++  fflush(stdout);
++
++  printf("USD DECODER: ===== COMPILED MODEL LIGHTS =====\n");
++
++  mjModel* debug_model = mj_compile(spec, nullptr);
++
++  if (debug_model == nullptr) {
++    printf("USD DECODER: diagnostic compilation failed: %s\n",
++           mjs_getError(spec));
++  } else {
++    printf("USD DECODER: compiled nlight=%d\n", debug_model->nlight);
++
++    for (int i = 0; i < debug_model->nlight; ++i) {
++        printf(
++            "MODEL LIGHT %d: type=%d active=%d intensity=%.6g "
++            "pos=(%.4f, %.4f, %.4f) dir=(%.4f, %.4f, %.4f) "
++            "cutoff=%.4f softness=%.4f "
++            "ambient=(%.3f, %.3f, %.3f) "
++            "diffuse=(%.3f, %.3f, %.3f) "
++            "attenuation=(%.6g, %.6g, %.6g) range=%.6g exponent=%.6g "
++            "specular=(%.3f, %.3f, %.3f)\n",
++            i,
++            debug_model->light_type[i],
++            debug_model->light_active[i],
++            debug_model->light_intensity[i],
++            debug_model->light_pos[3 * i],
++            debug_model->light_pos[3 * i + 1],
++            debug_model->light_pos[3 * i + 2],
++            debug_model->light_dir[3 * i],
++            debug_model->light_dir[3 * i + 1],
++            debug_model->light_dir[3 * i + 2],
++            debug_model->light_cutoff[i],
++            debug_model->light_softness[i],
++            debug_model->light_ambient[3 * i],
++            debug_model->light_ambient[3 * i + 1],
++            debug_model->light_ambient[3 * i + 2],
++            debug_model->light_diffuse[3 * i],
++            debug_model->light_diffuse[3 * i + 1],
++            debug_model->light_diffuse[3 * i + 2],
++            debug_model->light_attenuation[3 * i],
++            debug_model->light_attenuation[3 * i + 1],
++            debug_model->light_attenuation[3 * i + 2],
++            debug_model->light_range[i],
++            debug_model->light_exponent[i],
++            debug_model->light_specular[3 * i],
++            debug_model->light_specular[3 * i + 1],
++            debug_model->light_specular[3 * i + 2]);
++
++    }
++
++    mj_deleteModel(debug_model);
++  }
++
++  printf("USD DECODER: ===== END COMPILED MODEL LIGHTS =====\n");
++  fflush(stdout);
++
+   return spec;
+ }
+ 
+ namespace {
+ // load 2D
+ mjSpec* Decode(mjResource* resource, const mjVFS* vfs) {
++  printf("USD DECODER: before UsdStage::Open\n");
++  fflush(stdout);
++
+   auto stage = pxr::UsdStage::Open(resource->name);
++
++  printf("USD DECODER: after UsdStage::Open\n");
++  fflush(stdout);
++
+   return ParseStage(stage);
+ }
+ 
+ int CanDecode(const mjResource* resource) {
++  printf("USD DECODER: CanDecode called for %s\n", resource->name);
++  fflush(stdout);
++
+   std::string_view name(resource->name);
+   return name.ends_with(".usd") || name.ends_with(".usda") ||
+          name.ends_with(".usdc") || name.ends_with(".usdz");
+@@ -2810,11 +3392,35 @@ int CanDecode(const mjResource* resource) {
+ 
+ // clang-format off
+ mjPLUGIN_LIB_INIT(usd_decoder) {
++  printf("USD DECODER: INIT ENTERED\n");
++  fflush(stdout);
++
+   mjpDecoder decoder;
+   mjp_defaultDecoder(&decoder);
+   decoder.content_type = "model/usd";
+   decoder.extension = ".usd|.usda|.usdc|.usdz";
+   decoder.decode = Decode;
+   decoder.can_decode = CanDecode;
++
++  printf("USD DECODER: BEFORE REGISTER\n");
++  fflush(stdout);
++
+   mjp_registerDecoder(&decoder);
++
++  printf("USD DECODER: AFTER REGISTER\n");
++  fflush(stdout);
++}
++
++#ifdef _WIN32
++extern "C" BOOL WINAPI DllMain(
++    HINSTANCE hinstDLL,
++    DWORD fdwReason,
++    LPVOID lpReserved) {
++
++  if (fdwReason == DLL_PROCESS_ATTACH) {
++    OutputDebugStringA("USD DLL: PROCESS ATTACH\n");
++  }
++
++  return TRUE;
+ }
++#endif
+diff --git a/python/mujoco/CMakeLists.txt b/python/mujoco/CMakeLists.txt
+index 90221dcf..20280996 100644
+--- a/python/mujoco/CMakeLists.txt
++++ b/python/mujoco/CMakeLists.txt
+@@ -316,7 +316,7 @@ findorfetch(
+ # ==================== MUJOCO PYTHON BINDINGS ==================================
+ set(SIMULATE_BUILD_EXECUTABLE OFF)
+ set(SIMULATE_GLFW_DYNAMIC_SYMBOLS ON)
+-add_subdirectory(simulate)
++add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../simulate ${CMAKE_CURRENT_BINARY_DIR}/simulate)
+ 
+ add_subdirectory(util)
+ 
+@@ -327,16 +327,16 @@ target_link_libraries(mujoco_private_api_header INTERFACE mujoco)
+ 
+ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/enum_traits.h)
+   add_library(enum_traits INTERFACE)
+-  target_sources(enum_traits INTERFACE enum_traits.h)
++  target_sources(enum_traits INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/enum_traits.h)
+ else()
+   add_custom_command(
+     OUTPUT enum_traits.h
+-    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${mujoco_SOURCE_DIR}/mujoco/python/mujoco ${Python3_EXECUTABLE}
++    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE}
+             ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_enum_traits.py > enum_traits.h
+     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_enum_traits.py
+   )
+   add_library(enum_traits INTERFACE)
+-  target_sources(enum_traits INTERFACE enum_traits.h)
++  target_sources(enum_traits INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/enum_traits.h)
+   target_include_directories(
+     enum_traits INTERFACE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
+   )
+@@ -345,16 +345,16 @@ target_link_libraries(enum_traits INTERFACE mujoco absl::core_headers)
+ 
+ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/function_traits.h)
+   add_library(function_traits INTERFACE)
+-  target_sources(function_traits INTERFACE function_traits.h)
++  target_sources(function_traits INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/function_traits.h)
+ else()
+   add_custom_command(
+     OUTPUT function_traits.h
+-    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${mujoco_SOURCE_DIR}/mujoco/python/mujoco ${Python3_EXECUTABLE}
++    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE}
+             ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_function_traits.py > function_traits.h
+     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_function_traits.py
+   )
+   add_library(function_traits INTERFACE)
+-  target_sources(function_traits INTERFACE function_traits.h)
++  target_sources(function_traits INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/function_traits.h)
+   target_include_directories(
+     function_traits INTERFACE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
+   )
+@@ -400,6 +400,12 @@ add_library(structs_wrappers STATIC
+   serialization.h
+   indexers.cc
+ )
++
++set_target_properties(
++  structs_wrappers
++  PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE
++)
++
+ target_include_directories(structs_wrappers PRIVATE ${Python3_INCLUDE_DIRS})
+ target_link_libraries(
+   structs_wrappers
+@@ -546,11 +552,13 @@ if(APPLE)
+   set_target_properties(_structs PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
+ endif()
+ 
++set(SPECS_CC_INC ${CMAKE_CURRENT_BINARY_DIR}/specs.cc.inc)
++
+ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/specs.cc.inc)
+   add_custom_command(
+-    OUTPUT specs.cc.inc
+-    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${mujoco_SOURCE_DIR}/mujoco/python ${Python3_EXECUTABLE}
+-            ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_spec_bindings.py > specs.cc.inc
++    OUTPUT ${SPECS_CC_INC}
++    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE}
++            ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_spec_bindings.py > ${SPECS_CC_INC}
+     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_spec_bindings.py
+   )
+ endif()
+@@ -560,8 +568,13 @@ mujoco_pybind11_module(
+   specs.cc
+   specs_wrapper.h
+   specs_wrapper.cc
+-  specs.cc.inc
++  ${SPECS_CC_INC}
++)
++target_include_directories(
++  _specs
++  PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
+ )
++
+ target_link_libraries(
+   _specs
+   PRIVATE mujoco
+diff --git a/python/mujoco/structs.cc b/python/mujoco/structs.cc
+index 2d5b7119..7c3d3133 100644
+--- a/python/mujoco/structs.cc
++++ b/python/mujoco/structs.cc
+@@ -168,12 +168,12 @@ PYBIND11_MODULE(_structs, m, pybind11::mod_gil_not_used()) {
+ 
+   // ==================== MJVISUAL =============================================
+   py::class_<MjVisualWrapper> mjVisual(m, "MjVisual");
+-  mjVisual.def("__copy__", [](const MjVisualWrapper& other) {
+-    return MjVisualWrapper(other);
+-  });
+-  mjVisual.def("__deepcopy__", [](const MjVisualWrapper& other, py::dict) {
+-    return MjVisualWrapper(other);
+-  });
++  // mjVisual.def("__copy__", [](const MjVisualWrapper& other) {
++  //   return MjVisualWrapper(other);
++  // });
++  // mjVisual.def("__deepcopy__", [](const MjVisualWrapper& other, py::dict) {
++  //   return MjVisualWrapper(other);
++  // });
+   mjVisual.def("__eq__", StructsEqual<MjVisualWrapper>);
+   // Special __repr__ implementation for MjVisual, since:
+   // 1. Types under MjVisual confuse StructRepr;
+@@ -227,13 +227,13 @@ PYBIND11_MODULE(_structs, m, pybind11::mod_gil_not_used()) {
+ #undef X
+ 
+   py::class_<MjVisualHeadlightWrapper> mjVisualHeadlight(mjVisual, "Headlight");
+-  mjVisualHeadlight.def("__copy__", [](const MjVisualHeadlightWrapper& other) {
+-    return MjVisualHeadlightWrapper(other);
+-  });
+-  mjVisualHeadlight.def("__deepcopy__",
+-                        [](const MjVisualHeadlightWrapper& other, py::dict) {
+-                          return MjVisualHeadlightWrapper(other);
+-                        });
++  // mjVisualHeadlight.def("__copy__", [](const MjVisualHeadlightWrapper& other) {
++  //   return MjVisualHeadlightWrapper(other);
++  // });
++  // mjVisualHeadlight.def("__deepcopy__",
++  //                       [](const MjVisualHeadlightWrapper& other, py::dict) {
++  //                         return MjVisualHeadlightWrapper(other);
++  //                       });
+   DefineStructFunctions(mjVisualHeadlight);
+ #define X(type, var, dim)                                                   \
+   mjVisualHeadlight.def_property(                                           \
+@@ -275,13 +275,13 @@ PYBIND11_MODULE(_structs, m, pybind11::mod_gil_not_used()) {
+ #undef X
+ 
+   py::class_<MjVisualRgbaWrapper> mjVisualRgba(mjVisual, "Rgba");
+-  mjVisualRgba.def("__copy__", [](const MjVisualRgbaWrapper& other) {
+-    return MjVisualRgbaWrapper(other);
+-  });
+-  mjVisualRgba.def("__deepcopy__",
+-                   [](const MjVisualRgbaWrapper& other, py::dict) {
+-                     return MjVisualRgbaWrapper(other);
+-                   });
++  // mjVisualRgba.def("__copy__", [](const MjVisualRgbaWrapper& other) {
++  //   return MjVisualRgbaWrapper(other);
++  // });
++  // mjVisualRgba.def("__deepcopy__",
++  //                  [](const MjVisualRgbaWrapper& other, py::dict) {
++  //                    return MjVisualRgbaWrapper(other);
++  //                  });
+   DefineStructFunctions(mjVisualRgba);
+ #define XVEC(type, var, dim) \
+   DefinePyArray(mjVisualRgba, #var, &MjVisualRgbaWrapper::var);
+diff --git a/python/mujoco/structs.h b/python/mujoco/structs.h
+index 450c7dbf..3ebb55c9 100644
+--- a/python/mujoco/structs.h
++++ b/python/mujoco/structs.h
+@@ -254,6 +254,7 @@ class MjWrapper<raw::MjVisualHeadlight>
+   MjWrapper(const MjWrapper& other);
+   MjWrapper(MjWrapper&&) = default;
+   MjWrapper(raw::MjVisualHeadlight* ptr, pybind11::handle owner);
++
+   ~MjWrapper() = default;
+ 
+   #define X(type, var, dim)
+@@ -278,6 +279,7 @@ class MjWrapper<raw::MjVisualRgba> : public WrapperBase<raw::MjVisualRgba> {
+   MjWrapper(const MjWrapper& other);
+   MjWrapper(MjWrapper&&) = default;
+   MjWrapper(raw::MjVisualRgba* ptr, pybind11::handle owner);
++
+   ~MjWrapper() = default;
+ 
+ #define XVEC(type, var, dim)                                       \
+@@ -1146,6 +1148,89 @@ static InitPyArray(T (&buf)[N], pybind11::handle owner) {
+   return MjStructList<T>(buf, N, owner);
+ }
+ 
++// Definitions for MJVISUAL wrappers.
++// These stay in this header because the underlying MuJoCo visual
++// subtypes have internal linkage.
++
++inline MjWrapper<raw::MjVisualHeadlight>::MjWrapper()
++    : WrapperBase(new raw::MjVisualHeadlight{}),
++      ambient(InitPyArray(ptr_->ambient, owner_)),
++      diffuse(InitPyArray(ptr_->diffuse, owner_)),
++      specular(InitPyArray(ptr_->specular, owner_)) {}
++
++inline MjWrapper<raw::MjVisualHeadlight>::MjWrapper(
++    const MjWrapper<raw::MjVisualHeadlight>& other)
++    : MjWrapper() {
++  *this->ptr_ = *other.ptr_;
++}
++
++inline MjWrapper<raw::MjVisualHeadlight>::MjWrapper(
++    raw::MjVisualHeadlight* ptr, pybind11::handle owner)
++    : WrapperBase(ptr, owner),
++      ambient(InitPyArray(ptr_->ambient, owner_)),
++      diffuse(InitPyArray(ptr_->diffuse, owner_)),
++      specular(InitPyArray(ptr_->specular, owner_)) {}
++
++inline MjWrapper<raw::MjVisualRgba>::MjWrapper()
++    : WrapperBase(new raw::MjVisualRgba{}),
++      fog(InitPyArray(ptr_->fog, owner_)),
++      haze(InitPyArray(ptr_->haze, owner_)),
++      force(InitPyArray(ptr_->force, owner_)),
++      inertia(InitPyArray(ptr_->inertia, owner_)),
++      joint(InitPyArray(ptr_->joint, owner_)),
++      actuator(InitPyArray(ptr_->actuator, owner_)),
++      actuatornegative(InitPyArray(ptr_->actuatornegative, owner_)),
++      actuatorpositive(InitPyArray(ptr_->actuatorpositive, owner_)),
++      com(InitPyArray(ptr_->com, owner_)),
++      camera(InitPyArray(ptr_->camera, owner_)),
++      light(InitPyArray(ptr_->light, owner_)),
++      selectpoint(InitPyArray(ptr_->selectpoint, owner_)),
++      connect(InitPyArray(ptr_->connect, owner_)),
++      contactpoint(InitPyArray(ptr_->contactpoint, owner_)),
++      contactforce(InitPyArray(ptr_->contactforce, owner_)),
++      contactfriction(InitPyArray(ptr_->contactfriction, owner_)),
++      contacttorque(InitPyArray(ptr_->contacttorque, owner_)),
++      contactgap(InitPyArray(ptr_->contactgap, owner_)),
++      rangefinder(InitPyArray(ptr_->rangefinder, owner_)),
++      constraint(InitPyArray(ptr_->constraint, owner_)),
++      slidercrank(InitPyArray(ptr_->slidercrank, owner_)),
++      crankbroken(InitPyArray(ptr_->crankbroken, owner_)),
++      frustum(InitPyArray(ptr_->frustum, owner_)) {}
++
++inline MjWrapper<raw::MjVisualRgba>::MjWrapper(
++    const MjWrapper<raw::MjVisualRgba>& other)
++    : MjWrapper() {
++  *this->ptr_ = *other.ptr_;
++}
++
++inline MjWrapper<raw::MjVisualRgba>::MjWrapper(
++    raw::MjVisualRgba* ptr, pybind11::handle owner)
++    : WrapperBase(ptr, owner),
++      fog(InitPyArray(ptr_->fog, owner_)),
++      haze(InitPyArray(ptr_->haze, owner_)),
++      force(InitPyArray(ptr_->force, owner_)),
++      inertia(InitPyArray(ptr_->inertia, owner_)),
++      joint(InitPyArray(ptr_->joint, owner_)),
++      actuator(InitPyArray(ptr_->actuator, owner_)),
++      actuatornegative(InitPyArray(ptr_->actuatornegative, owner_)),
++      actuatorpositive(InitPyArray(ptr_->actuatorpositive, owner_)),
++      com(InitPyArray(ptr_->com, owner_)),
++      camera(InitPyArray(ptr_->camera, owner_)),
++      light(InitPyArray(ptr_->light, owner_)),
++      selectpoint(InitPyArray(ptr_->selectpoint, owner_)),
++      connect(InitPyArray(ptr_->connect, owner_)),
++      contactpoint(InitPyArray(ptr_->contactpoint, owner_)),
++      contactforce(InitPyArray(ptr_->contactforce, owner_)),
++      contactfriction(InitPyArray(ptr_->contactfriction, owner_)),
++      contacttorque(InitPyArray(ptr_->contacttorque, owner_)),
++      contactgap(InitPyArray(ptr_->contactgap, owner_)),
++      rangefinder(InitPyArray(ptr_->rangefinder, owner_)),
++      constraint(InitPyArray(ptr_->constraint, owner_)),
++      slidercrank(InitPyArray(ptr_->slidercrank, owner_)),
++      crankbroken(InitPyArray(ptr_->crankbroken, owner_)),
++      frustum(InitPyArray(ptr_->frustum, owner_)) {}
++
++
+ // Helpers for defining array/tuple properties in pybind11 classes.
+ //
+ // Defines a NumPy array property of a Python class that supports assignments.
+diff --git a/python/mujoco/structs_wrappers.cc b/python/mujoco/structs_wrappers.cc
+index 4e47446b..616f4ddf 100644
+--- a/python/mujoco/structs_wrappers.cc
++++ b/python/mujoco/structs_wrappers.cc
+@@ -123,81 +123,6 @@ MjOptionWrapper::MjWrapper(const MjOptionWrapper& other) : MjOptionWrapper() {
+ }
+ 
+ // ==================== MJVISUAL ===============================================
+-#define X(var) var(InitPyArray(ptr_->var, owner_))
+-MjVisualHeadlightWrapper::MjWrapper()
+-    : WrapperBase(new raw::MjVisualHeadlight{}),
+-      X(ambient),
+-      X(diffuse),
+-      X(specular) {}
+-
+-MjVisualHeadlightWrapper::MjWrapper(raw::MjVisualHeadlight* ptr,
+-                                    py::handle owner)
+-    : WrapperBase(ptr, owner), X(ambient), X(diffuse), X(specular) {}
+-#undef X
+-
+-MjVisualHeadlightWrapper::MjWrapper(const MjVisualHeadlightWrapper& other)
+-    : MjVisualHeadlightWrapper() {
+-  *this->ptr_ = *other.ptr_;
+-}
+-
+-#define X(var) var(InitPyArray(ptr_->var, owner_))
+-MjVisualRgbaWrapper::MjWrapper()
+-    : WrapperBase(new raw::MjVisualRgba{}),
+-      X(fog),
+-      X(haze),
+-      X(force),
+-      X(inertia),
+-      X(joint),
+-      X(actuator),
+-      X(actuatornegative),
+-      X(actuatorpositive),
+-      X(com),
+-      X(camera),
+-      X(light),
+-      X(selectpoint),
+-      X(connect),
+-      X(contactpoint),
+-      X(contactforce),
+-      X(contactfriction),
+-      X(contacttorque),
+-      X(contactgap),
+-      X(rangefinder),
+-      X(constraint),
+-      X(slidercrank),
+-      X(crankbroken),
+-      X(frustum) {}
+-
+-MjVisualRgbaWrapper::MjWrapper(raw::MjVisualRgba* ptr, py::handle owner)
+-    : WrapperBase(ptr, owner),
+-      X(fog),
+-      X(haze),
+-      X(force),
+-      X(inertia),
+-      X(joint),
+-      X(actuator),
+-      X(actuatornegative),
+-      X(actuatorpositive),
+-      X(com),
+-      X(camera),
+-      X(light),
+-      X(selectpoint),
+-      X(connect),
+-      X(contactpoint),
+-      X(contactforce),
+-      X(contactfriction),
+-      X(contacttorque),
+-      X(contactgap),
+-      X(rangefinder),
+-      X(constraint),
+-      X(slidercrank),
+-      X(crankbroken),
+-      X(frustum) {}
+-#undef X
+-
+-MjVisualRgbaWrapper::MjWrapper(const MjVisualRgbaWrapper& other)
+-    : MjVisualRgbaWrapper() {
+-  *this->ptr_ = *other.ptr_;
+-}
+ 
+ MjVisualWrapper::MjWrapper()
+     : WrapperBase(new raw::MjVisual{}),
+diff --git a/src/experimental/usd/CMakeLists.txt b/src/experimental/usd/CMakeLists.txt
+index 0464ef72..ea6e9b5b 100644
+--- a/src/experimental/usd/CMakeLists.txt
++++ b/src/experimental/usd/CMakeLists.txt
+@@ -102,17 +102,40 @@ function(configure_houdini_target target_name link_scope include_scope)
+   )
+ endfunction()
+ 
++## ----- Shared MJCF USD implementation -----
++
++add_library(usdMjcfCore STATIC)
++
++target_sources(usdMjcfCore PRIVATE
++  plugins/mjcf/mujoco_to_usd.cc
++  plugins/mjcf/mujoco_to_usd.h
++  plugins/mjcf/utils.cc
++  plugins/mjcf/utils.h
++)
++
++target_include_directories(usdMjcfCore PRIVATE
++  "${CMAKE_CURRENT_SOURCE_DIR}/plugins"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../../../include"
++)
++
++target_compile_definitions(usdMjcfCore PRIVATE NOMINMAX)
++
++target_link_libraries(usdMjcfCore PRIVATE
++  ${OPENUSD_CORE_LIBS}
++)
++
+ ## usdMjcf
+ 
+ add_library(${MJCF_PLUGIN_TARGET_NAME} SHARED)
+ target_sources(${MJCF_PLUGIN_TARGET_NAME} PRIVATE
+   plugins/mjcf/mjcf_file_format.cc
+   plugins/mjcf/mjcf_file_format.h
+-  plugins/mjcf/mujoco_to_usd.cc
+-  plugins/mjcf/mujoco_to_usd.h
+-  plugins/mjcf/utils.cc
+-  plugins/mjcf/utils.h
+ )
++
++if(MSVC)
++  target_compile_definitions(${MJCF_PLUGIN_TARGET_NAME} PRIVATE NOMINMAX)
++endif()
++
+ set_target_properties(${MJCF_PLUGIN_TARGET_NAME} PROPERTIES
+   OUTPUT_NAME ${MJCF_PLUGIN_TARGET_NAME}
+   ${DEFAULT_CXX_VISIBILITY_PROPS}
+@@ -124,6 +147,7 @@ target_include_directories(${MJCF_PLUGIN_TARGET_NAME} PRIVATE
+ ## ----- mjcPhysics -----
+ 
+ add_library(${MJC_PHYSICS_PLUGIN_TARGET_NAME} SHARED)
++target_compile_definitions(${MJC_PHYSICS_PLUGIN_TARGET_NAME} PRIVATE NOMINMAX)
+ target_sources(${MJC_PHYSICS_PLUGIN_TARGET_NAME} PRIVATE
+   mjcPhysics/actuator.cpp
+   mjcPhysics/collisionAPI.cpp
+@@ -157,12 +181,21 @@ target_sources(mujoco PRIVATE
+   writer.cc
+ )
+ 
++target_link_libraries(mujoco PRIVATE
++  usdMjcfCore
++)
++
++
+ # pxr/usd/tf/hashset.h might include deprecated headers so disable this check
+ # when compiling with USD enabled.
+-target_compile_options(
+-     mujoco
+-     PRIVATE -Wno-deprecated
+-)
++if(MSVC)
++  target_compile_definitions(mujoco PRIVATE NOMINMAX)
++else()
++  target_compile_options(
++       mujoco
++       PRIVATE -Wno-deprecated
++  )
++endif()
+ 
+ # Configure RPATH for macOS and UNIX.
+ if(APPLE)
+@@ -188,6 +221,7 @@ target_link_libraries(${MJC_PHYSICS_PLUGIN_TARGET_NAME} PRIVATE
+ )
+ 
+ target_link_libraries(${MJCF_PLUGIN_TARGET_NAME} PRIVATE
++  usdMjcfCore
+   ${OPENUSD_CORE_LIBS}
+   mujoco
+   tinyxml2
+diff --git a/src/experimental/usd/plugins/mjcf/mjcf_file_format.cc b/src/experimental/usd/plugins/mjcf/mjcf_file_format.cc
+index 4fcdc505..12c35602 100644
+--- a/src/experimental/usd/plugins/mjcf/mjcf_file_format.cc
++++ b/src/experimental/usd/plugins/mjcf/mjcf_file_format.cc
+@@ -41,6 +41,10 @@
+ #include <pxr/usd/sdf/fileFormat.h>
+ #include <pxr/usd/sdf/layer.h>
+ 
++#ifdef _WIN32
++#define strcasecmp _stricmp
++#endif
++
+ PXR_NAMESPACE_OPEN_SCOPE
+ 
+ TF_DEFINE_PUBLIC_TOKENS(UsdMjcfFileFormatTokens, USD_MJCF_FILE_FORMAT_TOKENS);
+diff --git a/src/experimental/usd/plugins/mjcf/mujoco_to_usd.cc b/src/experimental/usd/plugins/mjcf/mujoco_to_usd.cc
+index 5e0350fc..47cda32a 100644
+--- a/src/experimental/usd/plugins/mjcf/mujoco_to_usd.cc
++++ b/src/experimental/usd/plugins/mjcf/mujoco_to_usd.cc
+@@ -145,9 +145,8 @@ using pxr::Tf_RegistryInit;
+ using pxr::TfEnum;
+ template <typename T>
+ using Arch_PerLibInit = pxr::Arch_PerLibInit<T>;
+-#if defined(ARCH_OS_DARWIN)
+ using Arch_ConstructorEntry = pxr::Arch_ConstructorEntry;
+-#endif
++using Arch_ConstructorInit = pxr::Arch_ConstructorInit;
+ enum ErrorCodes { UnsupportedActuatorTypeError, UnsupportedGeomTypeError, MujocoCompilationError };
+ 
+ TF_REGISTRY_FUNCTION(pxr::TfEnum) {
+diff --git a/test/experimental/CMakeLists.txt b/test/experimental/CMakeLists.txt
+index 2d0d5392..751a0c53 100644
+--- a/test/experimental/CMakeLists.txt
++++ b/test/experimental/CMakeLists.txt
+@@ -15,8 +15,13 @@
+ # Only support testing when building against a standalone version of USD.
+ if(MUJOCO_WITH_USD)
+   add_library(usd_test_utils STATIC usd/test_utils.h usd/test_utils.cc)
+-  target_include_directories(usd_test_utils PUBLIC ${MUJOCO_TEST_INCLUDE})
+-  target_compile_definitions(usd_test_utils PUBLIC MJSTATIC)
++target_include_directories(usd_test_utils PUBLIC ${MUJOCO_TEST_INCLUDE})
++target_compile_definitions(usd_test_utils PUBLIC MJSTATIC)
++
++if(MSVC)
++  target_compile_definitions(usd_test_utils PRIVATE NOMINMAX)
++endif()
++
+   target_link_libraries(
+     usd_test_utils
+     PUBLIC usd
+diff --git a/test/experimental/usd/plugins/mjcf/CMakeLists.txt b/test/experimental/usd/plugins/mjcf/CMakeLists.txt
+index b5e07840..d65c135a 100644
+--- a/test/experimental/usd/plugins/mjcf/CMakeLists.txt
++++ b/test/experimental/usd/plugins/mjcf/CMakeLists.txt
+@@ -21,3 +21,7 @@ mujoco_test(mjcf_file_format_test ADDITIONAL_LINK_LIBRARIES
+   usd_test_utils
+   mjcPhysics
+   )
++
++if(MSVC)
++  target_compile_definitions(mjcf_file_format_test PRIVATE NOMINMAX)
++endif()
